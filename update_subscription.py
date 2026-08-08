@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a small HAPP subscription from an upstream public feed."""
+"""Build a small mixed HAPP subscription from public tested feeds."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import os
 import socket
+import statistics
 import sys
 import time
 import urllib.parse
@@ -16,24 +17,26 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-
-SOURCE_URL = os.environ.get(
-    "SOURCE_URL",
+BLACK_SOURCE_URL = os.environ.get(
+    "BLACK_SOURCE_URL",
+    os.environ.get(
+        "SOURCE_URL",
+        "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
+        "refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
+    ),
+)
+WHITE_SOURCE_URL = os.environ.get(
+    "WHITE_SOURCE_URL",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
-    "refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
+    "refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
 )
 OUTPUT_PATH = Path(os.environ.get("OUTPUT_PATH", "subscription.txt"))
-LIMIT = int(os.environ.get("SERVER_LIMIT", "10"))
+BLACK_LIMIT = int(os.environ.get("BLACK_SERVER_LIMIT", "10"))
+WHITE_LIMIT = int(os.environ.get("WHITE_SERVER_LIMIT", "5"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3.0"))
+PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "2")))
 SUPPORTED_SCHEMES = {
-    "vless",
-    "vmess",
-    "trojan",
-    "ss",
-    "socks",
-    "socks5",
-    "hysteria2",
-    "hy2",
+    "vless", "vmess", "trojan", "ss", "socks", "socks5", "hysteria2", "hy2"
 }
 
 
@@ -57,16 +60,12 @@ def endpoint(config: str) -> tuple[str, int] | None:
             payload = config.split("://", 1)[1].split("#", 1)[0]
             data = json.loads(_decode_base64(payload).decode("utf-8"))
             return str(data["add"]), int(data["port"])
-
         if scheme == "ss":
-            body = config.split("://", 1)[1].split("#", 1)[0]
-            body = body.split("?", 1)[0]
+            body = config.split("://", 1)[1].split("#", 1)[0].split("?", 1)[0]
             if "@" not in body:
-                body = _decode_base64(body).decode("utf-8")
-                body = body.rsplit("@", 1)[-1]
+                body = _decode_base64(body).decode("utf-8").rsplit("@", 1)[-1]
                 host, port = body.rsplit(":", 1)
                 return host.strip("[]"), int(port)
-
         parsed = urllib.parse.urlsplit(config)
         if parsed.hostname and parsed.port:
             return parsed.hostname, parsed.port
@@ -75,16 +74,15 @@ def endpoint(config: str) -> tuple[str, int] | None:
     return None
 
 
-def fetch_candidates() -> list[Candidate]:
+def fetch_candidates(source_url: str) -> list[Candidate]:
     request = urllib.request.Request(
-        SOURCE_URL,
-        headers={"User-Agent": "happ-ten-node-subscription/1.0"},
+        source_url, headers={"User-Agent": "happ-mixed-subscription/2.0"}
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         text = response.read().decode("utf-8-sig")
 
     candidates: list[Candidate] = []
-    seen_endpoints: set[tuple[str, int]] = set()
+    seen_hosts: set[str] = set()
     for raw_line in text.splitlines():
         config = raw_line.strip()
         if not config or config.startswith("#") or "://" not in config:
@@ -92,23 +90,30 @@ def fetch_candidates() -> list[Candidate]:
         if config.split("://", 1)[0].lower() not in SUPPORTED_SCHEMES:
             continue
         address = endpoint(config)
-        if not address or address in seen_endpoints:
+        if not address or address[0] in seen_hosts:
             continue
-        seen_endpoints.add(address)
+        seen_hosts.add(address[0])
         candidates.append(Candidate(config, address[0], address[1]))
     return candidates
 
 
 def probe(candidate: Candidate) -> tuple[float, Candidate] | None:
-    started = time.perf_counter()
-    try:
-        with socket.create_connection((candidate.host, candidate.port), timeout=TIMEOUT):
-            return (time.perf_counter() - started) * 1000, candidate
-    except OSError:
-        return None
+    latencies: list[float] = []
+    for _ in range(PROBE_ATTEMPTS):
+        started = time.perf_counter()
+        try:
+            with socket.create_connection(
+                (candidate.host, candidate.port), timeout=TIMEOUT
+            ):
+                latencies.append((time.perf_counter() - started) * 1000)
+        except OSError:
+            return None
+    return statistics.median(latencies), candidate
 
 
-def select_live(candidates: list[Candidate]) -> list[tuple[float, Candidate]]:
+def select_live(
+    candidates: list[Candidate], limit: int
+) -> list[tuple[float, Candidate]]:
     results: list[tuple[float, Candidate]] = []
     workers = min(32, max(1, len(candidates)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -116,35 +121,52 @@ def select_live(candidates: list[Candidate]) -> list[tuple[float, Candidate]]:
             if result is not None:
                 results.append(result)
     results.sort(key=lambda item: item[0])
-    return results[:LIMIT]
+    return results[:limit]
 
 
-def render(selected: list[tuple[float, Candidate]]) -> str:
-    generated = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+def render(
+    black: list[tuple[float, Candidate]], white: list[tuple[float, Candidate]]
+) -> str:
+    generated = dt.datetime.now(dt.timezone.utc).astimezone().isoformat(
+        timespec="seconds"
+    )
     lines = [
-        "#profile-title: Наши 10 серверов",
+        "#profile-title: Наши VPN — обычные + белые списки",
         "#profile-update-interval: 1",
         f"#generated-at: {generated}",
-        f"#source: {SOURCE_URL}",
-        f"#count: {len(selected)}",
+        f"#count: {len(black) + len(white)}",
+        f"#black-source: {BLACK_SOURCE_URL}",
+        f"#white-source: {WHITE_SOURCE_URL}",
+        f"#black-count: {len(black)}",
+        f"#white-count: {len(white)}",
+        "# Обычные подключения (чёрные списки)",
     ]
-    lines.extend(item.config for _, item in selected)
+    lines.extend(item.config for _, item in black)
+    lines.append("# Резерв для режима белых списков в РФ")
+    lines.extend(item.config for _, item in white)
     return "\n".join(lines) + "\n"
 
 
 def main() -> int:
-    candidates = fetch_candidates()
-    selected = select_live(candidates)
-    if len(selected) < LIMIT:
+    black = select_live(fetch_candidates(BLACK_SOURCE_URL), BLACK_LIMIT)
+    black_endpoints = {(item.host, item.port) for _, item in black}
+    white_candidates = [
+        item for item in fetch_candidates(WHITE_SOURCE_URL)
+        if (item.host, item.port) not in black_endpoints
+    ]
+    white = select_live(white_candidates, WHITE_LIMIT)
+    if len(black) < BLACK_LIMIT or len(white) < WHITE_LIMIT:
         print(
-            f"Refusing to replace subscription: only {len(selected)} of {LIMIT} "
-            "unique endpoints accepted a TCP connection.",
+            "Refusing to replace subscription: "
+            f"black={len(black)}/{BLACK_LIMIT}, white={len(white)}/{WHITE_LIMIT} "
+            f"accepted {PROBE_ATTEMPTS}/{PROBE_ATTEMPTS} TCP probes.",
             file=sys.stderr,
         )
         return 1
-    OUTPUT_PATH.write_text(render(selected), encoding="utf-8", newline="\n")
-    for latency, item in selected:
-        print(f"{latency:7.1f} ms  {item.host}:{item.port}")
+    OUTPUT_PATH.write_text(render(black, white), encoding="utf-8", newline="\n")
+    for group, selected in (("BLACK", black), ("WHITE", white)):
+        for latency, item in selected:
+            print(f"{group:5} {latency:7.1f} ms  {item.host}:{item.port}")
     return 0
 
 
