@@ -31,11 +31,21 @@ WHITE_SOURCE_URL = os.environ.get(
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
     "refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
 )
+BLACK_FALLBACK_SOURCE_URL = os.environ.get(
+    "BLACK_FALLBACK_SOURCE_URL",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
+    "refs/heads/main/BLACK_VLESS_RUS.txt",
+)
+BLACK_ALL_FALLBACK_SOURCE_URL = os.environ.get(
+    "BLACK_ALL_FALLBACK_SOURCE_URL",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
+    "refs/heads/main/BLACK_SS%2BAll_RUS.txt",
+)
 OUTPUT_PATH = Path(os.environ.get("OUTPUT_PATH", "subscription.txt"))
 BLACK_LIMIT = int(os.environ.get("BLACK_SERVER_LIMIT", "10"))
 WHITE_LIMIT = int(os.environ.get("WHITE_SERVER_LIMIT", "5"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3.0"))
-PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "2")))
+PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "3")))
 SUPPORTED_SCHEMES = {
     "vless", "vmess", "trojan", "ss", "socks", "socks5", "hysteria2", "hy2"
 }
@@ -64,6 +74,14 @@ COUNTRY_NAMES = (
     ("japan", "🇯🇵 Япония"),
     ("singapore", "🇸🇬 Сингапур"),
 )
+
+BLACK_COUNTRY_QUOTAS = {
+    "🌐 Anycast": 4,
+    "🇩🇪 Германия": 2,
+    "🇳🇱 Нидерланды": 2,
+    "🇫🇮 Финляндия": 1,
+    "🇵🇱 Польша": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -134,6 +152,18 @@ def fetch_candidates(source_url: str) -> list[Candidate]:
     return candidates
 
 
+def merge_candidates(*groups: list[Candidate]) -> list[Candidate]:
+    merged: list[Candidate] = []
+    seen_hosts: set[str] = set()
+    for group in groups:
+        for item in group:
+            if item.host in seen_hosts:
+                continue
+            seen_hosts.add(item.host)
+            merged.append(item)
+    return merged
+
+
 def probe(candidate: Candidate) -> tuple[float, Candidate] | None:
     latencies: list[float] = []
     for _ in range(PROBE_ATTEMPTS):
@@ -151,6 +181,10 @@ def probe(candidate: Candidate) -> tuple[float, Candidate] | None:
 def select_live(
     candidates: list[Candidate], limit: int
 ) -> list[tuple[float, Candidate]]:
+    return probe_live(candidates)[:limit]
+
+
+def probe_live(candidates: list[Candidate]) -> list[tuple[float, Candidate]]:
     results: list[tuple[float, Candidate]] = []
     workers = min(32, max(1, len(candidates)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -158,7 +192,41 @@ def select_live(
             if result is not None:
                 results.append(result)
     results.sort(key=lambda item: item[0])
-    return results[:limit]
+    return results
+
+
+def select_country_quotas(
+    candidates: list[Candidate], quotas: dict[str, int]
+) -> list[tuple[float, Candidate]]:
+    live = probe_live(candidates)
+    selected: list[tuple[float, Candidate]] = []
+    missing: list[str] = []
+    for country, required in quotas.items():
+        matches = [
+            item for item in live if display_country(item[1].config) == country
+        ][:required]
+        selected.extend(matches)
+        if len(matches) < required:
+            missing.append(f"{country}: {len(matches)}/{required}")
+    if missing:
+        raise RuntimeError("not enough live country nodes: " + ", ".join(missing))
+    return selected
+
+
+def select_diverse(
+    candidates: list[Candidate], limit: int, max_per_location: int = 2
+) -> list[tuple[float, Candidate]]:
+    selected: list[tuple[float, Candidate]] = []
+    counts: collections.Counter[str] = collections.Counter()
+    for item in probe_live(candidates):
+        country = display_country(item[1].config)
+        if counts[country] >= max_per_location:
+            continue
+        selected.append(item)
+        counts[country] += 1
+        if len(selected) == limit:
+            break
+    return selected
 
 
 def display_country(config: str) -> str:
@@ -199,6 +267,8 @@ def render(
         f"#generated-at: {generated}",
         f"#count: {len(black) + len(white)}",
         f"#black-source: {BLACK_SOURCE_URL}",
+        f"#black-fallback-source: {BLACK_FALLBACK_SOURCE_URL}",
+        f"#black-all-fallback-source: {BLACK_ALL_FALLBACK_SOURCE_URL}",
         f"#white-source: {WHITE_SOURCE_URL}",
         f"#black-count: {len(black)}",
         f"#white-count: {len(white)}",
@@ -211,13 +281,26 @@ def render(
 
 
 def main() -> int:
-    black = select_live(fetch_candidates(BLACK_SOURCE_URL), BLACK_LIMIT)
+    if sum(BLACK_COUNTRY_QUOTAS.values()) != BLACK_LIMIT:
+        raise RuntimeError("BLACK_SERVER_LIMIT must match country quotas")
+    black_candidates = merge_candidates(
+        fetch_candidates(BLACK_SOURCE_URL),
+        fetch_candidates(BLACK_FALLBACK_SOURCE_URL),
+        fetch_candidates(BLACK_ALL_FALLBACK_SOURCE_URL),
+    )
+    requested_countries = set(BLACK_COUNTRY_QUOTAS)
+    black_candidates = [
+        item
+        for item in black_candidates
+        if display_country(item.config) in requested_countries
+    ]
+    black = select_country_quotas(black_candidates, BLACK_COUNTRY_QUOTAS)
     black_endpoints = {(item.host, item.port) for _, item in black}
     white_candidates = [
         item for item in fetch_candidates(WHITE_SOURCE_URL)
         if (item.host, item.port) not in black_endpoints
     ]
-    white = select_live(white_candidates, WHITE_LIMIT)
+    white = select_diverse(white_candidates, WHITE_LIMIT)
     if len(black) < BLACK_LIMIT or len(white) < WHITE_LIMIT:
         print(
             "Refusing to replace subscription: "
