@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import concurrent.futures
 import datetime as dt
 import json
@@ -38,6 +39,31 @@ PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "2")))
 SUPPORTED_SCHEMES = {
     "vless", "vmess", "trojan", "ss", "socks", "socks5", "hysteria2", "hy2"
 }
+
+COUNTRY_NAMES = (
+    ("the netherlands", "Нидерланды"),
+    ("netherlands", "Нидерланды"),
+    ("united kingdom", "Великобритания"),
+    ("united states", "США"),
+    ("germany", "Германия"),
+    ("france", "Франция"),
+    ("poland", "Польша"),
+    ("latvia", "Латвия"),
+    ("estonia", "Эстония"),
+    ("finland", "Финляндия"),
+    ("canada", "Канада"),
+    ("russia", "Россия"),
+    ("sweden", "Швеция"),
+    ("norway", "Норвегия"),
+    ("switzerland", "Швейцария"),
+    ("austria", "Австрия"),
+    ("spain", "Испания"),
+    ("italy", "Италия"),
+    ("romania", "Румыния"),
+    ("turkey", "Турция"),
+    ("japan", "Япония"),
+    ("singapore", "Сингапур"),
+)
 
 
 @dataclass(frozen=True)
@@ -78,8 +104,19 @@ def fetch_candidates(source_url: str) -> list[Candidate]:
     request = urllib.request.Request(
         source_url, headers={"User-Agent": "happ-mixed-subscription/2.0"}
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        text = response.read().decode("utf-8-sig")
+    last_error: OSError | None = None
+    text: str | None = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                text = response.read().decode("utf-8-sig")
+            break
+        except OSError as error:
+            last_error = error
+            if attempt < 3:
+                time.sleep(attempt * 2)
+    if text is None:
+        raise RuntimeError(f"could not download feed: {source_url}") from last_error
 
     candidates: list[Candidate] = []
     seen_hosts: set[str] = set()
@@ -124,6 +161,32 @@ def select_live(
     return results[:limit]
 
 
+def display_country(config: str) -> str:
+    fragment = config.partition("#")[2]
+    label = urllib.parse.unquote(fragment).lower()
+    for needle, translated in COUNTRY_NAMES:
+        if needle in label:
+            return translated
+    if "anycast" in label:
+        return "Anycast"
+    return "VPN-сервер"
+
+
+def rename_configs(
+    selected: list[tuple[float, Candidate]], category: str
+) -> list[str]:
+    totals = collections.Counter(display_country(item.config) for _, item in selected)
+    indexes: collections.Counter[str] = collections.Counter()
+    renamed: list[str] = []
+    for latency, item in selected:
+        country = display_country(item.config)
+        indexes[country] += 1
+        number = f" {indexes[country]}" if totals[country] > 1 else ""
+        label = f"{country}{number} ({category}) • TCP {max(1, round(latency))} мс"
+        renamed.append(item.config.partition("#")[0] + "#" + urllib.parse.quote(label))
+    return renamed
+
+
 def render(
     black: list[tuple[float, Candidate]], white: list[tuple[float, Candidate]]
 ) -> str:
@@ -141,9 +204,9 @@ def render(
         f"#white-count: {len(white)}",
         "# Обычные подключения (чёрные списки)",
     ]
-    lines.extend(item.config for _, item in black)
+    lines.extend(rename_configs(black, "обычный"))
     lines.append("# Резерв для режима белых списков в РФ")
-    lines.extend(item.config for _, item in white)
+    lines.extend(rename_configs(white, "белые списки"))
     return "\n".join(lines) + "\n"
 
 
