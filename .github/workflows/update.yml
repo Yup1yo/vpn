@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Select ten reachable nodes
+      - name: Select 10 regular and 5 whitelist nodes
         run: python update_subscription.py
       - name: Publish changes
         run: |
