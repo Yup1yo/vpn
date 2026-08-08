@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a small mixed HAPP subscription from public tested feeds."""
+"""Build a 20-node HAPP subscription from maintained public feeds."""
 
 from __future__ import annotations
 
@@ -42,10 +42,13 @@ BLACK_ALL_FALLBACK_SOURCE_URL = os.environ.get(
     "refs/heads/main/BLACK_SS%2BAll_RUS.txt",
 )
 OUTPUT_PATH = Path(os.environ.get("OUTPUT_PATH", "subscription.txt"))
-BLACK_LIMIT = int(os.environ.get("BLACK_SERVER_LIMIT", "10"))
+BLACK_LIMIT = int(os.environ.get("BLACK_SERVER_LIMIT", "15"))
 WHITE_LIMIT = int(os.environ.get("WHITE_SERVER_LIMIT", "5"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3.0"))
-PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "3")))
+PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "4")))
+MAX_REGULAR_PER_LOCATION = max(
+    1, int(os.environ.get("MAX_REGULAR_PER_LOCATION", "4"))
+)
 SUPPORTED_SCHEMES = {
     "vless", "vmess", "trojan", "ss", "socks", "socks5", "hysteria2", "hy2"
 }
@@ -74,15 +77,6 @@ COUNTRY_NAMES = (
     ("japan", "🇯🇵 Япония"),
     ("singapore", "🇸🇬 Сингапур"),
 )
-
-BLACK_COUNTRY_QUOTAS = {
-    "🌐 Anycast": 4,
-    "🇩🇪 Германия": 2,
-    "🇳🇱 Нидерланды": 2,
-    "🇫🇮 Финляндия": 1,
-    "🇵🇱 Польша": 1,
-}
-
 
 @dataclass(frozen=True)
 class Candidate:
@@ -118,6 +112,18 @@ def endpoint(config: str) -> tuple[str, int] | None:
     return None
 
 
+def has_encrypted_transport(config: str) -> bool:
+    """Reject plain VLESS links; other supported protocols encrypt by design."""
+    scheme = config.split("://", 1)[0].lower()
+    if scheme != "vless":
+        return True
+    try:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(config).query)
+    except ValueError:
+        return False
+    return query.get("security", [""])[0].lower() in {"tls", "reality"}
+
+
 def fetch_candidates(source_url: str) -> list[Candidate]:
     request = urllib.request.Request(
         source_url, headers={"User-Agent": "happ-mixed-subscription/2.0"}
@@ -143,6 +149,8 @@ def fetch_candidates(source_url: str) -> list[Candidate]:
         if not config or config.startswith("#") or "://" not in config:
             continue
         if config.split("://", 1)[0].lower() not in SUPPORTED_SCHEMES:
+            continue
+        if not has_encrypted_transport(config):
             continue
         address = endpoint(config)
         if not address or address[0] in seen_hosts:
@@ -216,14 +224,30 @@ def select_country_quotas(
 def select_diverse(
     candidates: list[Candidate], limit: int, max_per_location: int = 2
 ) -> list[tuple[float, Candidate]]:
+    """Prefer low latency while preventing one location from taking the whole list.
+
+    If the diversity pass cannot fill the requested amount, use the next fastest
+    live endpoints. This keeps the published feed complete during source churn.
+    """
+    live = probe_live(candidates)
     selected: list[tuple[float, Candidate]] = []
     counts: collections.Counter[str] = collections.Counter()
-    for item in probe_live(candidates):
+    selected_endpoints: set[tuple[str, int]] = set()
+    for item in live:
         country = display_country(item[1].config)
         if counts[country] >= max_per_location:
             continue
         selected.append(item)
+        selected_endpoints.add((item[1].host, item[1].port))
         counts[country] += 1
+        if len(selected) == limit:
+            return selected
+    for item in live:
+        endpoint_key = (item[1].host, item[1].port)
+        if endpoint_key in selected_endpoints:
+            continue
+        selected.append(item)
+        selected_endpoints.add(endpoint_key)
         if len(selected) == limit:
             break
     return selected
@@ -262,7 +286,7 @@ def render(
         timespec="seconds"
     )
     lines = [
-        "#profile-title: Наши VPN — обычные + белые списки",
+        "#profile-title: NotV VPN — 20 быстрых серверов",
         "#profile-update-interval: 1",
         f"#generated-at: {generated}",
         f"#count: {len(black) + len(white)}",
@@ -272,6 +296,8 @@ def render(
         f"#white-source: {WHITE_SOURCE_URL}",
         f"#black-count: {len(black)}",
         f"#white-count: {len(white)}",
+        f"#probe-attempts: {PROBE_ATTEMPTS}",
+        "#selection: lowest median TCP-connect latency among stable encrypted public nodes",
         "# Обычные подключения (чёрные списки)",
     ]
     lines.extend(rename_configs(black, "обычный"))
@@ -281,26 +307,22 @@ def render(
 
 
 def main() -> int:
-    if sum(BLACK_COUNTRY_QUOTAS.values()) != BLACK_LIMIT:
-        raise RuntimeError("BLACK_SERVER_LIMIT must match country quotas")
     black_candidates = merge_candidates(
         fetch_candidates(BLACK_SOURCE_URL),
         fetch_candidates(BLACK_FALLBACK_SOURCE_URL),
         fetch_candidates(BLACK_ALL_FALLBACK_SOURCE_URL),
     )
-    requested_countries = set(BLACK_COUNTRY_QUOTAS)
-    black_candidates = [
-        item
-        for item in black_candidates
-        if display_country(item.config) in requested_countries
-    ]
-    black = select_country_quotas(black_candidates, BLACK_COUNTRY_QUOTAS)
+    black = select_diverse(
+        black_candidates,
+        BLACK_LIMIT,
+        max_per_location=MAX_REGULAR_PER_LOCATION,
+    )
     black_endpoints = {(item.host, item.port) for _, item in black}
     white_candidates = [
         item for item in fetch_candidates(WHITE_SOURCE_URL)
         if (item.host, item.port) not in black_endpoints
     ]
-    white = select_diverse(white_candidates, WHITE_LIMIT)
+    white = select_diverse(white_candidates, WHITE_LIMIT, max_per_location=2)
     if len(black) < BLACK_LIMIT or len(white) < WHITE_LIMIT:
         print(
             "Refusing to replace subscription: "
