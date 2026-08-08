@@ -41,28 +41,28 @@ SUPPORTED_SCHEMES = {
 }
 
 COUNTRY_NAMES = (
-    ("the netherlands", "Нидерланды"),
-    ("netherlands", "Нидерланды"),
-    ("united kingdom", "Великобритания"),
-    ("united states", "США"),
-    ("germany", "Германия"),
-    ("france", "Франция"),
-    ("poland", "Польша"),
-    ("latvia", "Латвия"),
-    ("estonia", "Эстония"),
-    ("finland", "Финляндия"),
-    ("canada", "Канада"),
-    ("russia", "Россия"),
-    ("sweden", "Швеция"),
-    ("norway", "Норвегия"),
-    ("switzerland", "Швейцария"),
-    ("austria", "Австрия"),
-    ("spain", "Испания"),
-    ("italy", "Италия"),
-    ("romania", "Румыния"),
-    ("turkey", "Турция"),
-    ("japan", "Япония"),
-    ("singapore", "Сингапур"),
+    ("the netherlands", "🇳🇱 Нидерланды"),
+    ("netherlands", "🇳🇱 Нидерланды"),
+    ("united kingdom", "🇬🇧 Великобритания"),
+    ("united states", "🇺🇸 США"),
+    ("germany", "🇩🇪 Германия"),
+    ("france", "🇫🇷 Франция"),
+    ("poland", "🇵🇱 Польша"),
+    ("latvia", "🇱🇻 Латвия"),
+    ("estonia", "🇪🇪 Эстония"),
+    ("finland", "🇫🇮 Финляндия"),
+    ("canada", "🇨🇦 Канада"),
+    ("russia", "🇷🇺 Россия"),
+    ("sweden", "🇸🇪 Швеция"),
+    ("norway", "🇳🇴 Норвегия"),
+    ("switzerland", "🇨🇭 Швейцария"),
+    ("austria", "🇦🇹 Австрия"),
+    ("spain", "🇪🇸 Испания"),
+    ("italy", "🇮🇹 Италия"),
+    ("romania", "🇷🇴 Румыния"),
+    ("turkey", "🇹🇷 Турция"),
+    ("japan", "🇯🇵 Япония"),
+    ("singapore", "🇸🇬 Сингапур"),
 )
 
 
@@ -168,8 +168,8 @@ def display_country(config: str) -> str:
         if needle in label:
             return translated
     if "anycast" in label:
-        return "Anycast"
-    return "VPN-сервер"
+        return "🌐 Anycast"
+    return "🌐 VPN-сервер"
 
 
 def rename_configs(
@@ -178,11 +178,11 @@ def rename_configs(
     totals = collections.Counter(display_country(item.config) for _, item in selected)
     indexes: collections.Counter[str] = collections.Counter()
     renamed: list[str] = []
-    for latency, item in selected:
+    for _, item in selected:
         country = display_country(item.config)
         indexes[country] += 1
         number = f" {indexes[country]}" if totals[country] > 1 else ""
-        label = f"{country}{number} ({category}) • TCP {max(1, round(latency))} мс"
+        label = f"{country}{number} ({category})"
         renamed.append(item.config.partition("#")[0] + "#" + urllib.parse.quote(label))
     return renamed
 
