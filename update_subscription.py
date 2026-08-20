@@ -44,10 +44,10 @@ BLACK_ALL_FALLBACK_SOURCE_URL = os.environ.get(
 OUTPUT_PATH = Path(os.environ.get("OUTPUT_PATH", "subscription.txt"))
 BLACK_LIMIT = int(os.environ.get("BLACK_SERVER_LIMIT", "15"))
 WHITE_LIMIT = int(os.environ.get("WHITE_SERVER_LIMIT", "5"))
-TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "3.0"))
-PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "4")))
+TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "2.5"))
+PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "5")))
 MAX_REGULAR_PER_LOCATION = max(
-    1, int(os.environ.get("MAX_REGULAR_PER_LOCATION", "4"))
+    1, int(os.environ.get("MAX_REGULAR_PER_LOCATION", "3"))
 )
 SUPPORTED_SCHEMES = {
     "vless", "vmess", "trojan", "ss", "socks", "socks5", "hysteria2", "hy2"
@@ -183,7 +183,11 @@ def probe(candidate: Candidate) -> tuple[float, Candidate] | None:
                 latencies.append((time.perf_counter() - started) * 1000)
         except OSError:
             return None
-    return statistics.median(latencies), candidate
+    # A node with a low one-off result but large jitter is less useful than a
+    # slightly slower, stable one. The score still strongly favors low latency.
+    median = statistics.median(latencies)
+    jitter = max(latencies) - min(latencies)
+    return median + jitter * 0.35, candidate
 
 
 def select_live(
