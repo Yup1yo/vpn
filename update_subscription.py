@@ -209,8 +209,30 @@ def sing_box_outbound(candidate: Candidate) -> dict[str, object] | None:
     parsed = urllib.parse.urlsplit(candidate.config)
     query = urllib.parse.parse_qs(parsed.query)
     scheme = parsed.scheme.lower()
-    if scheme not in {"vless", "trojan"} or not parsed.hostname or not parsed.port:
+    if scheme not in {"vless", "trojan", "hysteria2", "hy2", "ss"}:
         return None
+    if scheme == "ss":
+        return sing_box_shadowsocks_outbound(candidate)
+    if not parsed.hostname or not parsed.port:
+        return None
+    user = urllib.parse.unquote(parsed.username or "")
+    if not user:
+        return None
+    if scheme in {"hysteria2", "hy2"}:
+        tls: dict[str, object] = {
+            "enabled": True,
+            "server_name": query.get("sni", [parsed.hostname])[0],
+        }
+        if query.get("insecure", ["0"])[0].lower() in {"1", "true"}:
+            tls["insecure"] = True
+        return {
+            "type": "hysteria2",
+            "tag": "proxy",
+            "server": parsed.hostname,
+            "server_port": parsed.port,
+            "password": user,
+            "tls": tls,
+        }
     security = query.get("security", ["tls"])[0].lower()
     transport_type = query.get("type", ["tcp"])[0].lower()
     if transport_type not in {"tcp", "raw", "ws", "grpc"}:
@@ -237,9 +259,6 @@ def sing_box_outbound(candidate: Candidate) -> dict[str, object] | None:
         }
     if security not in {"tls", "reality"}:
         return None
-    user = urllib.parse.unquote(parsed.username or "")
-    if not user:
-        return None
     outbound: dict[str, object] = {
         "type": scheme,
         "tag": "proxy",
@@ -262,6 +281,32 @@ def sing_box_outbound(candidate: Candidate) -> dict[str, object] | None:
             "service_name": query.get("serviceName", [""])[0],
         }
     return outbound
+
+
+def sing_box_shadowsocks_outbound(candidate: Candidate) -> dict[str, object] | None:
+    """Decode both standard Shadowsocks URI forms for sing-box."""
+    raw = candidate.config.split("://", 1)[1].split("#", 1)[0].split("?", 1)[0]
+    try:
+        if "@" in raw:
+            encoded_auth, address = raw.rsplit("@", 1)
+            auth = urllib.parse.unquote(encoded_auth)
+            if ":" not in auth:
+                auth = _decode_base64(auth).decode("utf-8")
+            host, port_text = address.rsplit(":", 1)
+        else:
+            auth, address = _decode_base64(raw).decode("utf-8").rsplit("@", 1)
+            host, port_text = address.rsplit(":", 1)
+        method, password = auth.split(":", 1)
+        return {
+            "type": "shadowsocks",
+            "tag": "proxy",
+            "server": host.strip("[]"),
+            "server_port": int(port_text),
+            "method": method,
+            "password": password,
+        }
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def available_local_port() -> int:
