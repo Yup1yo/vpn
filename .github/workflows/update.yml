@@ -17,6 +17,25 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Install sing-box for end-to-end tunnel checks
+        run: |
+          python - <<'PY' > /tmp/sing-box-url.txt
+          import json
+          import urllib.request
+          release = json.load(urllib.request.urlopen(
+              "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+          ))
+          for asset in release["assets"]:
+              url = asset["browser_download_url"]
+              if url.endswith("linux-amd64.tar.gz"):
+                  print(url)
+                  break
+          else:
+              raise SystemExit("linux-amd64 sing-box asset was not found")
+          PY
+          curl --fail --location --retry 3 "$(cat /tmp/sing-box-url.txt)" -o /tmp/sing-box.tar.gz
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          echo "SING_BOX_BIN=$(find /tmp -type f -name sing-box -perm -111 | head -n 1)" >> "$GITHUB_ENV"
       - name: Select 20 stable low-latency nodes every 5 minutes
         run: python update_subscription.py
       - name: Publish changes
