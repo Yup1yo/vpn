@@ -11,7 +11,9 @@ import json
 import os
 import socket
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -48,6 +50,14 @@ TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "2.5"))
 PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "3")))
 MAX_REGULAR_PER_LOCATION = max(
     1, int(os.environ.get("MAX_REGULAR_PER_LOCATION", "3"))
+)
+SING_BOX_BIN = os.environ.get("SING_BOX_BIN", "")
+REAL_TEST_URL = os.environ.get(
+    "REAL_TEST_URL", "https://cp.cloudflare.com/generate_204"
+)
+REAL_VALIDATION_POOL = max(20, int(os.environ.get("REAL_VALIDATION_POOL", "48")))
+REAL_VALIDATION_WORKERS = max(
+    1, int(os.environ.get("REAL_VALIDATION_WORKERS", "6"))
 )
 SUPPORTED_SCHEMES = {
     "vless", "vmess", "trojan", "ss", "socks", "socks5", "hysteria2", "hy2"
@@ -190,6 +200,146 @@ def probe(candidate: Candidate) -> tuple[float, Candidate] | None:
     return median + jitter * 0.35, candidate
 
 
+def sing_box_outbound(candidate: Candidate) -> dict[str, object] | None:
+    """Build a sing-box outbound for share links we can prove end-to-end.
+
+    Unsupported schemes are deliberately skipped during the cloud validation
+    stage. A TCP socket being open is not enough to call a VPN node working.
+    """
+    parsed = urllib.parse.urlsplit(candidate.config)
+    query = urllib.parse.parse_qs(parsed.query)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"vless", "trojan"} or not parsed.hostname or not parsed.port:
+        return None
+    security = query.get("security", ["tls"])[0].lower()
+    transport_type = query.get("type", ["tcp"])[0].lower()
+    if transport_type not in {"tcp", "raw", "ws", "grpc"}:
+        return None
+    tls: dict[str, object] = {"enabled": security in {"tls", "reality"}}
+    if tls["enabled"]:
+        tls["server_name"] = query.get("sni", [parsed.hostname])[0]
+        if query.get("insecure", ["0"])[0].lower() in {"1", "true"}:
+            tls["insecure"] = True
+        fingerprint = query.get("fp", [""])[0]
+        if fingerprint:
+            tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
+        alpn = query.get("alpn", [""])[0]
+        if alpn:
+            tls["alpn"] = [item for item in alpn.split(",") if item]
+    if security == "reality":
+        public_key = query.get("pbk", [""])[0]
+        if not public_key:
+            return None
+        tls["reality"] = {
+            "enabled": True,
+            "public_key": public_key,
+            "short_id": query.get("sid", [""])[0],
+        }
+    if security not in {"tls", "reality"}:
+        return None
+    user = urllib.parse.unquote(parsed.username or "")
+    if not user:
+        return None
+    outbound: dict[str, object] = {
+        "type": scheme,
+        "tag": "proxy",
+        "server": parsed.hostname,
+        "server_port": parsed.port,
+        "tls": tls,
+    }
+    outbound["uuid" if scheme == "vless" else "password"] = user
+    if scheme == "vless" and query.get("flow", [""])[0]:
+        outbound["flow"] = query["flow"][0]
+    if transport_type == "ws":
+        outbound["transport"] = {
+            "type": "ws",
+            "path": query.get("path", ["/"])[0],
+            "headers": {"Host": query.get("host", [parsed.hostname])[0]},
+        }
+    elif transport_type == "grpc":
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": query.get("serviceName", [""])[0],
+        }
+    return outbound
+
+
+def available_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def probe_vpn(item: tuple[float, Candidate]) -> tuple[float, Candidate] | None:
+    """Confirm that a real HTTPS request can travel through a VPN tunnel."""
+    if not SING_BOX_BIN:
+        return item
+    tcp_score, candidate = item
+    outbound = sing_box_outbound(candidate)
+    if outbound is None:
+        return None
+    listen_port = available_local_port()
+    config = {
+        "log": {"level": "error", "timestamp": False},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "probe",
+                "listen": "127.0.0.1",
+                "listen_port": listen_port,
+            }
+        ],
+        "outbounds": [outbound],
+        "route": {"final": "proxy"},
+    }
+    with tempfile.TemporaryDirectory(prefix="notvvpn-probe-") as temp_dir:
+        config_path = Path(temp_dir) / "config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        process = subprocess.Popen(
+            [SING_BOX_BIN, "run", "-c", str(config_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(0.35)
+            started = time.perf_counter()
+            request = subprocess.run(
+                [
+                    "curl",
+                    "--proxy",
+                    f"http://127.0.0.1:{listen_port}",
+                    "--connect-timeout",
+                    "3",
+                    "--max-time",
+                    "7",
+                    "--output",
+                    "/dev/null",
+                    "--silent",
+                    "--show-error",
+                    "--write-out",
+                    "%{http_code}",
+                    REAL_TEST_URL,
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=9,
+            )
+            if request.returncode != 0 or request.stdout.strip() != "204":
+                return None
+            tunnel_latency = (time.perf_counter() - started) * 1000
+            return tcp_score + tunnel_latency, candidate
+        except (OSError, subprocess.SubprocessError):
+            return None
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
 def select_live(
     candidates: list[Candidate], limit: int
 ) -> list[tuple[float, Candidate]]:
@@ -204,7 +354,17 @@ def probe_live(candidates: list[Candidate]) -> list[tuple[float, Candidate]]:
             if result is not None:
                 results.append(result)
     results.sort(key=lambda item: item[0])
-    return results
+    if not SING_BOX_BIN:
+        return results
+    pool = results[:REAL_VALIDATION_POOL]
+    verified: list[tuple[float, Candidate]] = []
+    workers = min(REAL_VALIDATION_WORKERS, max(1, len(pool)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for result in executor.map(probe_vpn, pool):
+            if result is not None:
+                verified.append(result)
+    verified.sort(key=lambda item: item[0])
+    return verified
 
 
 def select_country_quotas(
@@ -301,7 +461,7 @@ def render(
         f"#black-count: {len(black)}",
         f"#white-count: {len(white)}",
         f"#probe-attempts: {PROBE_ATTEMPTS}",
-        "#selection: lowest median TCP-connect latency among stable encrypted public nodes",
+        "#selection: stable encrypted nodes verified by a real HTTPS request through sing-box",
         "# Обычные подключения (чёрные списки)",
     ]
     lines.extend(rename_configs(black, "обычный"))
