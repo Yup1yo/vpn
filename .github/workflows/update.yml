@@ -3,7 +3,7 @@ name: Update HAPP subscription
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - name: Select 15 regular and 5 whitelist nodes
+      - name: Select 20 stable low-latency nodes every 5 minutes
         run: python update_subscription.py
       - name: Publish changes
         run: |
