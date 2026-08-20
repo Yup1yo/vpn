@@ -33,6 +33,11 @@ WHITE_SOURCE_URL = os.environ.get(
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
     "refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
 )
+WHITE_SNI_FALLBACK_SOURCE_URL = os.environ.get(
+    "WHITE_SNI_FALLBACK_SOURCE_URL",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
+    "refs/heads/main/WHITE-SNI-RU-all.txt",
+)
 BLACK_FALLBACK_SOURCE_URL = os.environ.get(
     "BLACK_FALLBACK_SOURCE_URL",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
@@ -503,6 +508,7 @@ def render(
         f"#black-fallback-source: {BLACK_FALLBACK_SOURCE_URL}",
         f"#black-all-fallback-source: {BLACK_ALL_FALLBACK_SOURCE_URL}",
         f"#white-source: {WHITE_SOURCE_URL}",
+        f"#white-sni-fallback-source: {WHITE_SNI_FALLBACK_SOURCE_URL}",
         f"#black-count: {len(black)}",
         f"#white-count: {len(white)}",
         f"#probe-attempts: {PROBE_ATTEMPTS}",
@@ -528,7 +534,11 @@ def main() -> int:
     )
     black_endpoints = {(item.host, item.port) for _, item in black}
     white_candidates = [
-        item for item in fetch_candidates(WHITE_SOURCE_URL)
+        item
+        for item in merge_candidates(
+            fetch_candidates(WHITE_SOURCE_URL),
+            fetch_candidates(WHITE_SNI_FALLBACK_SOURCE_URL),
+        )
         if (item.host, item.port) not in black_endpoints
     ]
     white = select_diverse(white_candidates, WHITE_LIMIT, max_per_location=2)
