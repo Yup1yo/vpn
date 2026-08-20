@@ -45,7 +45,7 @@ OUTPUT_PATH = Path(os.environ.get("OUTPUT_PATH", "subscription.txt"))
 BLACK_LIMIT = int(os.environ.get("BLACK_SERVER_LIMIT", "15"))
 WHITE_LIMIT = int(os.environ.get("WHITE_SERVER_LIMIT", "5"))
 TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "2.5"))
-PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "5")))
+PROBE_ATTEMPTS = max(1, int(os.environ.get("PROBE_ATTEMPTS", "3")))
 MAX_REGULAR_PER_LOCATION = max(
     1, int(os.environ.get("MAX_REGULAR_PER_LOCATION", "3"))
 )
@@ -329,12 +329,14 @@ def main() -> int:
     white = select_diverse(white_candidates, WHITE_LIMIT, max_per_location=2)
     if len(black) < BLACK_LIMIT or len(white) < WHITE_LIMIT:
         print(
-            "Refusing to replace subscription: "
+            "Keeping previous subscription; the fresh pool is too small: "
             f"black={len(black)}/{BLACK_LIMIT}, white={len(white)}/{WHITE_LIMIT} "
             f"accepted {PROBE_ATTEMPTS}/{PROBE_ATTEMPTS} TCP probes.",
             file=sys.stderr,
         )
-        return 1
+        # Do not replace a usable feed with a partial set during a temporary
+        # source outage. A following five-minute run will try again.
+        return 0
     OUTPUT_PATH.write_text(render(black, white), encoding="utf-8", newline="\n")
     for group, selected in (("BLACK", black), ("WHITE", white)):
         for latency, item in selected:
